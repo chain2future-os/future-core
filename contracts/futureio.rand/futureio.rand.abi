@@ -1,0 +1,270 @@
+{
+  "version": "ultraio:1.0",
+  "types": [
+    {
+      "new_type_name": "account_name",
+      "type": "name"
+    },
+    {
+      "new_type_name": "Asset",
+      "type": "asset"
+    },
+    {
+      "new_type_name": "u64",
+      "type": "uint64"
+    },
+    {
+      "new_type_name": "i32",
+      "type": "int32"
+    }
+  ],
+  "structs": [
+    {
+      "fields": [
+        {
+          "name": "from",
+          "type": "account_name"
+        },
+        {
+          "name": "to",
+          "type": "account_name"
+        },
+        {
+          "name": "value",
+          "type": "Asset"
+        },
+        {
+          "name": "memo",
+          "type": "string"
+        }
+      ],
+      "base": "",
+      "name": "transfer"
+    },
+    {
+      "fields": [],
+      "base": "",
+      "name": "unregister"
+    },
+    {
+      "fields": [],
+      "base": "",
+      "name": "redeem"
+    },
+    {
+      "fields": [
+        {
+          "name": "pk_proof",
+          "type": "string"
+        },
+        {
+          "name": "blockNum",
+          "type": "u64"
+        }
+      ],
+      "base": "",
+      "name": "vote"
+    },
+    {
+      "fields": [],
+      "base": "",
+      "name": "getMainVoteInfo"
+    },
+    {
+      "fields": [],
+      "base": "",
+      "name": "query"
+    },
+    {
+      "fields": [
+        {
+          "name": "bckNum",
+          "type": "u64"
+        }
+      ],
+      "base": "",
+      "name": "queryBck"
+    },
+    {
+      "fields": [],
+      "base": "",
+      "name": "version"
+    },
+    {
+      "fields": [
+        {
+          "name": "name",
+          "type": "account_name"
+        },
+        {
+          "name": "belongBckNums",
+          "type": "u64[]"
+        },
+        {
+          "name": "voteVals",
+          "type": "u64[]"
+        },
+        {
+          "name": "deposit",
+          "type": "u64"
+        },
+        {
+          "name": "regisBckNum",
+          "type": "u64"
+        },
+        {
+          "name": "unregisBckNum",
+          "type": "u64"
+        },
+        {
+          "name": "role",
+          "type": "i32"
+        },
+        {
+          "name": "bonus",
+          "type": "i32"
+        }
+      ],
+      "base": "",
+      "name": "Voter"
+    },
+    {
+      "fields": [
+        {
+          "name": "waiters",
+          "type": "account_name[]"
+        }
+      ],
+      "base": "",
+      "name": "Waiter"
+    },
+    {
+      "fields": [
+        {
+          "name": "blockNum",
+          "type": "u64"
+        },
+        {
+          "name": "val",
+          "type": "u64"
+        },
+        {
+          "name": "code",
+          "type": "i32"
+        }
+      ],
+      "base": "",
+      "name": "RandRecord"
+    },
+    {
+      "fields": [
+        {
+          "name": "bcknum",
+          "type": "u64"
+        },
+        {
+          "name": "votedUser",
+          "type": "account_name[]"
+        }
+      ],
+      "base": "",
+      "name": "VoteHistory"
+    }
+  ],
+  "actions": [
+    {
+      "ricardian_contract": "",
+      "name": "transfer",
+      "type": "transfer",
+      "ability": "normal"
+    },
+    {
+      "ricardian_contract": "",
+      "name": "unregister",
+      "type": "unregister",
+      "ability": "normal"
+    },
+    {
+      "ricardian_contract": "",
+      "name": "redeem",
+      "type": "redeem",
+      "ability": "normal"
+    },
+    {
+      "ricardian_contract": "",
+      "name": "vote",
+      "type": "vote",
+      "ability": "normal"
+    },
+    {
+      "ricardian_contract": "",
+      "name": "getMainVoteInfo",
+      "type": "getMainVoteInfo",
+      "ability": "pureview"
+    },
+    {
+      "ricardian_contract": "",
+      "name": "query",
+      "type": "query",
+      "ability": "pureview"
+    },
+    {
+      "ricardian_contract": "",
+      "name": "queryBck",
+      "type": "queryBck",
+      "ability": "pureview"
+    },
+    {
+      "ricardian_contract": "",
+      "name": "version",
+      "type": "version",
+      "ability": "pureview"
+    }
+  ],
+  "tables": [
+    {
+      "index_type": "i64",
+      "keys_names": [
+        "currency"
+      ],
+      "keys_types": [
+        "uint64"
+      ],
+      "name": "voter",
+      "type": "Voter"
+    },
+    {
+      "index_type": "i64",
+      "keys_names": [
+        "currency"
+      ],
+      "keys_types": [
+        "uint64"
+      ],
+      "name": "waiter",
+      "type": "Waiter"
+    },
+    {
+      "index_type": "i64",
+      "keys_names": [
+        "currency"
+      ],
+      "keys_types": [
+        "uint64"
+      ],
+      "name": "rand",
+      "type": "RandRecord"
+    },
+    {
+      "index_type": "i64",
+      "keys_names": [
+        "currency"
+      ],
+      "keys_types": [
+        "uint64"
+      ],
+      "name": "history",
+      "type": "VoteHistory"
+    }
+  ]
+}

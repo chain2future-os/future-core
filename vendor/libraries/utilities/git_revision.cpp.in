@@ -1,0 +1,14 @@
+#include <stdint.h>
+#include <future/utilities/git_revision.hpp>
+
+#define FUTURE_GIT_REVISION_SHA "@FUTURE_GIT_REVISION_SHA@"
+#define FUTURE_GIT_REVISION_UNIX_TIMESTAMP @FUTURE_GIT_REVISION_UNIX_TIMESTAMP@
+#define FUTURE_GIT_REVISION_DESCRIPTION "@FUTURE_GIT_REVISION_DESCRIPTION@"
+
+namespace futureio { namespace utilities {
+
+const char* const git_revision_sha = FUTURE_GIT_REVISION_SHA;
+const uint32_t git_revision_unix_timestamp = FUTURE_GIT_REVISION_UNIX_TIMESTAMP;
+const char* const git_revision_description = FUTURE_GIT_REVISION_DESCRIPTION;
+
+} } // end namespace futureio::utilities

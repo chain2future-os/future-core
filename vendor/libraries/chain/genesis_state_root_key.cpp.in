@@ -1,0 +1,12 @@
+/**
+ *  @file
+ *  @copyright defined in future/LICENSE.txt
+ */
+
+#include <futureio/chain/genesis_state.hpp>
+
+namespace futureio { namespace chain {
+
+const string genesis_state::futureio_root_key = "${FUTUREIO_ROOT_KEY}";
+
+} } // namespace futureio::chain

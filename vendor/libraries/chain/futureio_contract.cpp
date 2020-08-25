@@ -1,0 +1,544 @@
+/**
+ *  @file
+ *  @copyright defined in future/LICENSE.txt
+ */
+#include <futureio/chain/futureio_contract.hpp>
+#include <futureio/chain/contract_table_objects.hpp>
+
+#include <futureio/chain/controller.hpp>
+#include <futureio/chain/transaction_context.hpp>
+#include <futureio/chain/apply_context.hpp>
+#include <futureio/chain/transaction.hpp>
+#include <futureio/chain/exceptions.hpp>
+
+#include <futureio/chain/account_object.hpp>
+#include <futureio/chain/permission_object.hpp>
+#include <futureio/chain/permission_link_object.hpp>
+#include <futureio/chain/global_property_object.hpp>
+#include <futureio/chain/contract_types.hpp>
+#include <futureio/chain/producer_object.hpp>
+
+#include <futureio/chain/wasm_interface.hpp>
+#include <futureio/chain/abi_serializer.hpp>
+#include <futureio/chain/database_utils.hpp>
+#include <futureio/chain/authorization_manager.hpp>
+#include <futureio/chain/resource_limits.hpp>
+#include <appbase/application.hpp>
+#include <futureio/chain_plugin/chain_plugin.hpp>
+#include <futureio/chain/whiteblacklist_object.hpp>
+
+namespace futureio { namespace chain {
+
+
+
+uint128_t transaction_id_to_sender_id( const transaction_id_type& tid ) {
+   fc::uint128_t _id(tid._hash[3], tid._hash[2]);
+   return (unsigned __int128)_id;
+}
+
+void validate_authority_precondition( const apply_context& context, const authority& auth ) {
+   for(const auto& a : auth.accounts) {
+      auto* acct = context.db.find<account_object, by_name>(a.permission.actor);
+      FUTURE_ASSERT( acct != nullptr, action_validate_exception,
+                  "account '${account}' does not exist",
+                  ("account", a.permission.actor)
+                );
+
+      if( a.permission.permission == config::owner_name || a.permission.permission == config::active_name )
+         continue; // account was already checked to exist, so its owner and active permissions should exist
+
+      if( a.permission.permission == config::futureio_code_name ) // virtual futio.code permission does not really exist but is allowed
+         continue;
+
+      try {
+         context.control.get_authorization_manager().get_permission({a.permission.actor, a.permission.permission});
+      } catch( const permission_query_exception& ) {
+         FUTURE_THROW( action_validate_exception,
+                    "permission '${perm}' does not exist",
+                    ("perm", a.permission)
+                  );
+      }
+   }
+
+   if( context.control.is_producing_block() ) {
+      for( const auto& p : auth.keys ) {
+         context.control.check_key_list( p.key );
+      }
+   }
+}
+
+/**
+ *  This method is called assuming precondition_system_newaccount succeeds a
+ */
+void apply_futureio_newaccount(apply_context& context) {
+   auto create = context.act.data_as<newaccount>();
+   try {
+   context.require_authorization(create.creator);
+//   context.require_write_lock( config::futureio_auth_scope );
+   auto& authorization = context.control.get_mutable_authorization_manager();
+
+   FUTURE_ASSERT( validate(create.owner), action_validate_exception, "Invalid owner authority");
+   FUTURE_ASSERT( validate(create.active), action_validate_exception, "Invalid active authority");
+
+   auto& db = context.db;
+
+   auto name_str = name(create.name).to_string();
+
+   FUTURE_ASSERT( !create.name.empty(), action_validate_exception, "account name cannot be empty" );
+
+   auto p1 = name_str.find('.');
+   bool at_begin = (p1 != std::string::npos) && (p1 == 0);
+   auto p2 = name_str.rfind('.');
+   bool at_end   = (p2 != std::string::npos) && (p2 == name_str.length() - 1);
+   FUTURE_ASSERT( !(at_begin || at_end), action_validate_exception, "account name can't start/end with ." );
+   FUTURE_ASSERT( name_str.size() <= 12, action_validate_exception, "account names must be less than only 12 chars long" );
+
+   auto existing_account = db.find<account_object, by_name>(create.name);
+   FUTURE_ASSERT(existing_account == nullptr, account_name_exists_exception,
+              "Cannot create account named ${name}, as that name is already taken",
+              ("name", create.name));
+
+   const auto& new_account = db.create<account_object>([&](auto& a) {
+      a.name = create.name;
+      a.updateable = create.updateable;
+      a.creation_date = context.control.pending_block_time();
+   });
+
+   for( const auto& auth : { create.owner, create.active } ){
+      validate_authority_precondition( context, auth );
+   }
+
+   const auto& owner_permission  = authorization.create_permission( create.name, config::owner_name, 0,
+                                                                    std::move(create.owner) );
+   const auto& active_permission = authorization.create_permission( create.name, config::active_name, owner_permission.id,
+                                                                    std::move(create.active) );
+
+   context.control.get_mutable_resource_limits_manager().initialize_account(create.name);
+
+   int64_t ram_delta = config::overhead_per_account_ram_bytes;
+   ram_delta += 2*config::billable_size_v<permission_object>;
+   ilog("apply_futureio_newaccount : permission_object = ${ram_delta}, account = ${account}, owner_permission = ${owner_permission}, active_permission= ${active_permission}", ("ram_delta", ram_delta)("account", create.name)("owner_permission", owner_permission.auth.get_billable_size())("active_permission", active_permission.auth.get_billable_size()));
+   ram_delta += owner_permission.auth.get_billable_size();
+   ram_delta += active_permission.auth.get_billable_size();
+
+   context.trx_context.add_ram_usage( N(futureio), ram_delta ); //create.creator
+
+} FC_CAPTURE_AND_RETHROW( (create) ) }
+
+void apply_futureio_setcode(apply_context& context) {
+   const auto& cfg = context.control.get_global_properties().configuration;
+
+   auto& db = context.db;
+   auto  act = context.act.data_as<setcode>();
+   context.require_authorization(act.account);
+
+   FUTURE_ASSERT( act.vmtype == 0, invalid_contract_vm_type, "code should be 0" );
+   FUTURE_ASSERT( act.vmversion == 0, invalid_contract_vm_version, "version should be 0" );
+
+   fc::sha256 code_id; /// default ID == 0
+
+   if( act.code.size() > 0 ) {
+     code_id = fc::sha256::hash( act.code.data(), (uint32_t)act.code.size() );
+     wasm_interface::validate(context.control, act.code);
+   }
+
+    const auto& account = db.get<account_object, by_name>(act.account);
+    // if account has been deployed, then check updateable or not.
+    if (account.code.size() > 0) {
+        // std::cout << "set code account updateable : " << account.updateable << std::endl;
+         if(context.has_authorization(N(futureio)))
+            context.require_authorization(N(futureio));
+         else
+            FC_ASSERT(account.updateable, "contract account has deployed and it is not updateable.");
+    }
+
+   int64_t code_size = (int64_t)act.code.size();
+   int64_t old_size  = (int64_t)account.code.size() * config::setcode_ram_bytes_multiplier;
+   int64_t new_size  = code_size * config::setcode_ram_bytes_multiplier;
+
+   FUTURE_ASSERT( account.code_version != code_id, set_exact_code, "contract is already running this version of code" );
+
+   db.modify( account, [&]( auto& a ) {
+      /** TODO: consider whether a microsecond level local timestamp is sufficient to detect code version changes*/
+      // TODO: update setcode message to include the hash, then validate it in validate
+      a.last_code_update = context.control.pending_block_time();
+      a.code_version = code_id;
+      a.code.resize( code_size );
+      if( code_size > 0 )
+         memcpy( a.code.data(), act.code.data(), code_size );
+
+   });
+
+   auto const* sequence_obj_itr = db.find<account_sequence_object, by_name>(act.account);
+   if( !sequence_obj_itr ){
+       db.create<account_sequence_object>([&](auto & a) {
+          a.name = act.account;
+          a.code_sequence += 1;
+       });
+   } else {
+       db.modify( *sequence_obj_itr, [&]( auto& aso ) {
+          aso.code_sequence += 1;
+       });
+   }
+
+   if (new_size != old_size) {
+      context.trx_context.add_ram_usage( act.account, new_size - old_size );
+   }
+}
+
+void apply_futureio_setabi(apply_context& context) {
+   auto& db  = context.db;
+   auto  act = context.act.data_as<setabi>();
+
+   context.require_authorization(act.account);
+
+    const auto& account = db.get<account_object, by_name>(act.account);
+    // if account has been deployed, then check updateable or not.
+    if (account.abi.size() > 0) {
+        // std::cout << "set abi account updateable : " << account.updateable << std::endl;
+         if(context.has_authorization(N(futureio)))
+            context.require_authorization(N(futureio));
+         else
+            FC_ASSERT(account.updateable, "contract account has deployed and it is not updateable.");
+    }
+
+   int64_t abi_size = act.abi.size();
+
+   int64_t old_size = (int64_t)account.abi.size();
+   int64_t new_size = abi_size;
+
+   db.modify( account, [&]( auto& a ) {
+      a.abi.resize( abi_size );
+      if( abi_size > 0 )
+         memcpy( a.abi.data(), act.abi.data(), abi_size );
+   });
+
+   auto const* sequence_obj_itr = db.find<account_sequence_object, by_name>(act.account);
+    if( !sequence_obj_itr ){
+       db.create<account_sequence_object>([&](auto & a) {
+          a.name = act.account;
+          a.abi_sequence += 1;
+       });
+    } else {
+       db.modify( *sequence_obj_itr, [&]( auto& aso ) {
+          aso.abi_sequence += 1;
+       });
+    }
+
+   if (new_size != old_size) {
+      context.trx_context.add_ram_usage( act.account, new_size - old_size );
+   }
+}
+
+void apply_futureio_updateauth(apply_context& context) {
+
+   auto update = context.act.data_as<updateauth>();
+   context.require_authorization(update.account); // only here to mark the single authority on this action as used
+
+   auto& authorization = context.control.get_mutable_authorization_manager();
+   auto& db = context.db;
+
+   FUTURE_ASSERT(!update.permission.empty(), action_validate_exception, "Cannot create authority with empty name");
+   FUTURE_ASSERT( update.permission.to_string().find( "futio." ) != 0, action_validate_exception,
+               "Permission names that start with 'futio.' are reserved" );
+   FUTURE_ASSERT(update.permission != update.parent, action_validate_exception, "Cannot set an authority as its own parent");
+   db.get<account_object, by_name>(update.account);
+   FUTURE_ASSERT(validate(update.auth), action_validate_exception,
+              "Invalid authority: ${auth}", ("auth", update.auth));
+   if( update.permission == config::active_name )
+      FUTURE_ASSERT(update.parent == config::owner_name, action_validate_exception, "Cannot change active authority's parent from owner", ("update.parent", update.parent) );
+   if (update.permission == config::owner_name)
+      FUTURE_ASSERT(update.parent.empty(), action_validate_exception, "Cannot change owner authority's parent");
+   else
+      FUTURE_ASSERT(!update.parent.empty(), action_validate_exception, "Only owner permission can have empty parent" );
+
+   if( update.auth.waits.size() > 0 ) {
+      auto max_delay = context.control.get_global_properties().configuration.max_transaction_delay;
+      FUTURE_ASSERT( update.auth.waits.back().wait_sec <= max_delay, action_validate_exception,
+                  "Cannot set delay longer than max_transacton_delay, which is ${max_delay} seconds",
+                  ("max_delay", max_delay) );
+   }
+
+   validate_authority_precondition(context, update.auth);
+
+
+
+   auto permission = authorization.find_permission({update.account, update.permission});
+
+   // If a parent_id of 0 is going to be used to indicate the absence of a parent, then we need to make sure that the chain
+   // initializes permission_index with a dummy object that reserves the id of 0.
+   authorization_manager::permission_id_type parent_id = 0;
+   if( update.permission != config::owner_name ) {
+      auto& parent = authorization.get_permission({update.account, update.parent});
+      parent_id = parent.id;
+   }
+
+   if( permission ) {
+      FUTURE_ASSERT(parent_id == permission->parent, action_validate_exception,
+                 "Changing parent authority is not currently supported");
+
+
+      int64_t old_size = (int64_t)(config::billable_size_v<permission_object> + permission->auth.get_billable_size());
+
+      authorization.modify_permission( *permission, update.auth );
+
+      int64_t new_size = (int64_t)(config::billable_size_v<permission_object> + permission->auth.get_billable_size());
+
+      context.trx_context.add_ram_usage( config::system_account_name, new_size - old_size );//permission->owner
+   } else {
+      const auto& p = authorization.create_permission( update.account, update.permission, parent_id, update.auth );
+
+      int64_t new_size = (int64_t)(config::billable_size_v<permission_object> + p.auth.get_billable_size());
+
+      context.trx_context.add_ram_usage( config::system_account_name, new_size );//system_account_name  update.account
+   }
+}
+
+void apply_futureio_deleteauth(apply_context& context) {
+//   context.require_write_lock( config::futureio_auth_scope );
+
+   auto remove = context.act.data_as<deleteauth>();
+   context.require_authorization(remove.account); // only here to mark the single authority on this action as used
+
+   FUTURE_ASSERT(remove.permission != config::active_name, action_validate_exception, "Cannot delete active authority");
+   FUTURE_ASSERT(remove.permission != config::owner_name, action_validate_exception, "Cannot delete owner authority");
+
+   auto& authorization = context.control.get_mutable_authorization_manager();
+   auto& db = context.db;
+
+
+
+   { // Check for links to this permission
+      const auto& index = db.get_index<permission_link_index, by_permission_name>();
+      auto range = index.equal_range(boost::make_tuple(remove.account, remove.permission));
+      FUTURE_ASSERT(range.first == range.second, action_validate_exception,
+                 "Cannot delete a linked authority. Unlink the authority first. This authority is linked to ${code}::${type}.",
+                 ("code", string(range.first->code))("type", string(range.first->message_type)));
+   }
+
+   const auto& permission = authorization.get_permission({remove.account, remove.permission});
+   int64_t old_size = config::billable_size_v<permission_object> + permission.auth.get_billable_size();
+
+   authorization.remove_permission( permission );
+
+   context.trx_context.add_ram_usage( config::system_account_name, -old_size ); //remove.account
+
+}
+
+void apply_futureio_linkauth(apply_context& context) {
+//   context.require_write_lock( config::futureio_auth_scope );
+
+   auto requirement = context.act.data_as<linkauth>();
+   try {
+      FUTURE_ASSERT(!requirement.requirement.empty(), action_validate_exception, "Required permission cannot be empty");
+
+      context.require_authorization(requirement.account); // only here to mark the single authority on this action as used
+
+      auto& db = context.db;
+      const auto *account = db.find<account_object, by_name>(requirement.account);
+      FUTURE_ASSERT(account != nullptr, account_query_exception,
+                 "Failed to retrieve account: ${account}", ("account", requirement.account)); // Redundant?
+      const auto *code = db.find<account_object, by_name>(requirement.code);
+      FUTURE_ASSERT(code != nullptr, account_query_exception,
+                 "Failed to retrieve code for account: ${account}", ("account", requirement.code));
+      if( requirement.requirement != config::futureio_any_name ) {
+         const auto *permission = db.find<permission_object, by_name>(requirement.requirement);
+         FUTURE_ASSERT(permission != nullptr, permission_query_exception,
+                    "Failed to retrieve permission: ${permission}", ("permission", requirement.requirement));
+      }
+
+      auto link_key = boost::make_tuple(requirement.account, requirement.code, requirement.type);
+      auto link = db.find<permission_link_object, by_action_name>(link_key);
+
+      if( link ) {
+         FUTURE_ASSERT(link->required_permission != requirement.requirement, action_validate_exception,
+                    "Attempting to update required authority, but new requirement is same as old");
+         db.modify(*link, [requirement = requirement.requirement](permission_link_object& link) {
+             link.required_permission = requirement;
+         });
+      } else {
+         const auto& l =  db.create<permission_link_object>([&requirement](permission_link_object& link) {
+            link.account = requirement.account;
+            link.code = requirement.code;
+            link.message_type = requirement.type;
+            link.required_permission = requirement.requirement;
+         });
+
+         context.trx_context.add_ram_usage(
+            config::system_account_name,
+            (int64_t)(config::billable_size_v<permission_link_object>)
+         );
+      }
+
+  } FC_CAPTURE_AND_RETHROW((requirement))
+}
+
+void apply_futureio_unlinkauth(apply_context& context) {
+//   context.require_write_lock( config::futureio_auth_scope );
+
+   auto& db = context.db;
+   auto unlink = context.act.data_as<unlinkauth>();
+
+   context.require_authorization(unlink.account); // only here to mark the single authority on this action as used
+
+   auto link_key = boost::make_tuple(unlink.account, unlink.code, unlink.type);
+   auto link = db.find<permission_link_object, by_action_name>(link_key);
+   FUTURE_ASSERT(link != nullptr, action_validate_exception, "Attempting to unlink authority, but no link found");
+   context.trx_context.add_ram_usage(
+      config::system_account_name,
+      -(int64_t)(config::billable_size_v<permission_link_object>)
+   );
+
+   db.remove(*link);
+}
+
+void apply_futureio_canceldelay(apply_context& context) {
+   auto cancel = context.act.data_as<canceldelay>();
+   context.require_authorization(cancel.canceling_auth.actor); // only here to mark the single authority on this action as used
+
+   const auto& trx_id = cancel.trx_id;
+
+   context.cancel_deferred_transaction(transaction_id_to_sender_id(trx_id), account_name());
+}
+
+/**
+ *  This method is called when delaccount action is called
+ */
+void apply_futureio_delaccount(apply_context& context) {
+   auto delacc = context.act.data_as<delaccount>();
+   ilog("apply_futureio_delaccount : account = ${account}", ("account", delacc.account));
+   try {
+      context.require_authorization( config::system_account_name );
+      auto& authorization = context.control.get_mutable_authorization_manager();
+      auto& db = context.db;
+
+      auto const* del_account_itr = db.find<account_object, by_name>( delacc.account );
+      FUTURE_ASSERT(del_account_itr != nullptr, action_validate_exception, " The deleted account does not exist");
+      db.remove( *del_account_itr );
+      auto const* sequence_obj_itr = db.find<account_sequence_object, by_name>( delacc.account );
+      if( sequence_obj_itr ){
+         db.remove( *sequence_obj_itr );
+      }
+      context.control.get_mutable_resource_limits_manager().delete_resource_table( delacc.account );
+
+      auto const check_remove_permission_func = [&]( const permission_name& perm_name )-> int64_t {
+         { // Check for links to this permission
+            const auto& index = db.get_index<permission_link_index, by_permission_name>();
+            auto range = index.equal_range(boost::make_tuple(delacc.account, perm_name));
+            FUTURE_ASSERT(range.first == range.second, action_validate_exception,
+                     "Cannot delete a linked authority. Unlink the authority first. This authority is linked to ${code}::${type}.",
+                     ("code", string(range.first->code))("type", string(range.first->message_type)));
+         }
+         const auto& permission = authorization.get_permission({delacc.account, perm_name});
+         int64_t old_size = config::billable_size_v<permission_object> + permission.auth.get_billable_size();
+         authorization.remove_permission( permission );
+         return old_size;
+      };
+      int64_t total_old_size = 0;
+      const vector<permission_name> perm_name_list = authorization.get_all_permission_name( delacc.account );
+      FUTURE_ASSERT( perm_name_list.size() != 0, action_validate_exception, " permission name list is empty");
+      for( auto const perm_name : perm_name_list ) {
+         total_old_size += check_remove_permission_func( perm_name );
+      }
+      context.trx_context.add_ram_usage( config::system_account_name, -total_old_size );
+   } FC_CAPTURE_AND_RETHROW( (delacc) )
+}
+
+bool validate_white_black(white_black_type& w_b){
+   bool is_valid = false;
+   auto check_func = [&](const account_name& name){
+      FUTURE_ASSERT( name.good(), action_validate_exception, "validate_white_black, ${name} not vaild.", ("name", name));
+      is_valid = true;
+   };
+
+   for_each(w_b.actor_black.begin(), w_b.actor_black.end(), check_func);
+   for_each(w_b.actor_white.begin(), w_b.actor_white.end(), check_func);
+   for_each(w_b.contract_black.begin(), w_b.contract_black.end(), check_func);
+   for_each(w_b.contract_white.begin(), w_b.contract_white.end(), check_func);
+   for_each(w_b.action_black.begin(), w_b.action_black.end(), [&](const action_actor_type& act_actor){
+      FUTURE_ASSERT( act_actor.actor.good() && act_actor.action.good(), action_validate_exception, "validate_white_black, action_black ${a} not vaild", ("a", act_actor));
+      is_valid = true;
+   });
+   for_each(w_b.key_black.begin(), w_b.key_black.end(), [&](const public_key_type& pk){
+      FUTURE_ASSERT( pk.valid(), action_validate_exception, "validate_white_black, pk ${a} not vaild", ("a", pk));
+      is_valid = true;
+   });
+
+   return is_valid;
+}
+
+void apply_futureio_addwhiteblack(apply_context& context) {
+   auto data = context.act.data_as<addwhiteblack>();
+   auto& white_black = data.add_white_black;
+   context.require_authorization( config::system_account_name );
+
+   //If parameters is empty
+   FUTURE_ASSERT( validate_white_black(white_black), action_validate_exception, "addwhiteblack parameters not vaild, ${s}.", ("s", white_black));
+
+   //Futureio can't add to actor black list
+   FUTURE_ASSERT(std::find(white_black.actor_black.begin(), white_black.actor_black.end(), config::system_account_name) == white_black.actor_black.end(), action_validate_exception,
+      "futureio can't add to actor black");
+
+   //Futureio can't add to contract black list
+   FUTURE_ASSERT( std::find(white_black.contract_black.begin(), white_black.contract_black.end(), config::system_account_name) == white_black.contract_black.end(), action_validate_exception,
+      "futureio can't add to contract black");
+
+   //addwhiteblack and rmwhiteblack can't add to action black list
+   for_each(white_black.action_black.begin(), white_black.action_black.end(), [&](const action_actor_type& act_actor){
+      FUTURE_ASSERT( !(act_actor.actor == config::system_account_name && (act_actor.action == rmwhiteblack::get_name() || act_actor.action == addwhiteblack::get_name())),
+         action_validate_exception, "${s} can't add to action black", ("s", act_actor));
+   });
+
+   try {
+      auto& db = context.db;
+      auto& wb_object = db.get<whiteblacklist_object>();
+      db.modify(wb_object, [&](whiteblacklist_object& node) {
+         node.actor_blacklist.insert(white_black.actor_black.begin(), white_black.actor_black.end());
+         node.actor_whitelist.insert(white_black.actor_white.begin(), white_black.actor_white.end());
+         node.contract_blacklist.insert(white_black.contract_black.begin(), white_black.contract_black.end());
+         node.contract_whitelist.insert(white_black.contract_white.begin(), white_black.contract_white.end());
+         node.key_blacklist.insert(white_black.key_black.begin(), white_black.key_black.end());
+         for_each(white_black.action_black.begin(), white_black.action_black.end(), [&](const action_actor_type& act_actor){
+            node.action_blacklist.insert(std::make_pair(act_actor.actor, act_actor.action));
+         });
+      } );
+   } FC_CAPTURE_AND_RETHROW( (white_black) )
+}
+
+void apply_futureio_rmwhiteblack(apply_context& context) {
+   auto data = context.act.data_as<rmwhiteblack>();
+   auto& white_black = data.rm_white_black;
+   context.require_authorization( config::system_account_name );
+
+   //If parameters is empty
+   FUTURE_ASSERT( validate_white_black(white_black), action_validate_exception, "rmwhiteblack parameters not vaild, ${s}.", ("s", white_black));
+
+   try {
+      auto& db = context.db;
+      auto& wb_object = db.get<whiteblacklist_object>();
+
+      db.modify(wb_object, [&](whiteblacklist_object& node) {
+         for_each(white_black.actor_black.begin(), white_black.actor_black.end(), [&](const name& name){
+            node.actor_blacklist.erase(name);
+         });
+         for_each(white_black.actor_white.begin(), white_black.actor_white.end(), [&](const name& name){
+            node.actor_whitelist.erase(name);
+         });
+         for_each(white_black.contract_black.begin(), white_black.contract_black.end(), [&](const name& name){
+            node.contract_blacklist.erase(name);
+         });
+         for_each(white_black.contract_white.begin(), white_black.contract_white.end(), [&](const name& name){
+            node.contract_whitelist.erase(name);
+         });
+         for_each(white_black.key_black.begin(), white_black.key_black.end(), [&](const public_key_type& pk){
+            node.key_blacklist.erase(pk);
+         });
+
+         for_each(white_black.action_black.begin(), white_black.action_black.end(), [&](const action_actor_type& act_actor){
+            node.action_blacklist.erase(std::make_pair(act_actor.actor, act_actor.action));
+         });
+      } );
+   } FC_CAPTURE_AND_RETHROW( (white_black) )
+}
+
+} } // namespace futureio::chain

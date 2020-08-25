@@ -1,0 +1,7 @@
+add_subdirectory( binaryen )
+add_subdirectory( boringssl )
+add_subdirectory( libraries )
+add_subdirectory( pbc )
+add_subdirectory( miniupnpc )
+add_subdirectory( googletest )
+install(DIRECTORY magic_get/include/boost DESTINATION ${CMAKE_INSTALL_FULL_INCLUDEDIR})

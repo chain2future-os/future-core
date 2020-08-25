@@ -1,0 +1,6 @@
+add_subdirectory( nodfuture )
+add_subdirectory( clfuture )
+add_subdirectory( kfutured )
+add_subdirectory( wssfuture )
+add_subdirectory( futureio-abigen )
+add_subdirectory( cryfuture )

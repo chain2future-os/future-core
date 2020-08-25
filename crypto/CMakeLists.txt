@@ -1,0 +1,49 @@
+# ed25519
+
+file(GLOB HEADERS "include/crypto/ed25519/*.h")
+add_library( futureio_ed25519
+        src/ed25519/Digest.cpp
+        src/ed25519/Ed25519.cpp
+        src/ed25519/PrivateKey.cpp
+        src/ed25519/PublicKey.cpp
+        src/ed25519/Signature.cpp
+        ${HEADERS} )
+
+include_directories( "${PROJECT_SOURCE_DIR}/vendor/boringssl/include" )
+
+target_link_libraries( futureio_ed25519 futureio_pbc futureio_base fiat fc)
+target_include_directories( futureio_ed25519 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include/crypto" )
+
+# gm
+
+file(GLOB HEADERS "include/crypto/gm/sm2/*.h")
+
+add_library( futureio_gm
+        src/gm/sm2/ec.h
+        src/gm/sm2/numbers.h
+        src/gm/sm2/sm2.h
+        src/gm/sm2/sm2_err.c
+        src/gm/sm2/sm2_sign.c
+        src/gm/sm2/sm2_err.c
+        src/gm/sm2/PrivateKey.cpp
+        src/gm/sm2/PublicKey.cpp
+        src/gm/sm2/Signature.cpp
+        src/gm/sm3/Sm3.cpp
+        src/gm/sm4/Sm4.cpp
+        ${HEADERS} )
+
+target_link_libraries( futureio_gm futureio_base fc)
+
+target_include_directories( futureio_gm PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include/crypto" )
+
+# futureio_crypto
+file(GLOB HEADERS "include/crypto/*.h")
+add_library( futureio_crypto
+        src/Bls.cpp
+        src/Random.cpp
+        ${HEADERS} )
+
+#include_directories( "${PROJECT_SOURCE_DIR}/vendor/boringssl/include" )
+
+target_link_libraries( futureio_crypto futureio_gm futureio_ed25519)
+target_include_directories( futureio_crypto PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include/" )
